@@ -1,0 +1,248 @@
+api/CardResource.java
+package me.markgerald.api;
+
+import jakarta.inject.Inject;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
+import me.markgerald.generators.TokenGenerator;
+import me.markgerald.generators.TokenGeneratorProvider;
+import me.markgerald.model.PaymentProvider;
+import me.markgerald.request.CardRequest;
+import me.markgerald.response.CardResponse;
+import me.markgerald.storage.TokenStorage;
+import me.markgerald.validation.PaymentProviderValidation;
+
+@Path("/")
+public class CardResource {
+    @Inject
+    TokenGeneratorProvider tokenGeneratorProvider;
+
+    @Inject
+    PaymentProviderValidation paymentProviderValidation;
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    public Response registerCard(
+            CardRequest cardRequest,
+            @HeaderParam("customerId") @NotBlank @NotNull String customerId,
+            @HeaderParam("provider") @NotBlank @NotNull String providerHeaderValue
+    ) {
+        String cardNumber = cardRequest.getCardNumber();
+        String cvv = cardRequest.getCvv();
+        PaymentProvider selectedProvider = paymentProviderValidation
+                .parsePaymentProvider(providerHeaderValue);
+
+        if (selectedProvider == null) {
+            return Response.status(Response.Status.BAD_REQUEST)
+                    .entity("Invalid provider specified")
+                    .build();
+        }
+
+        TokenGenerator tokenGenerator = tokenGeneratorProvider
+                .getTokenGenerator(selectedProvider);
+        String token = tokenGenerator.generateToken(cardNumber, cvv);
+        TokenStorage.saveToken(customerId, token);
+
+        return Response.ok(new CardResponse(token)).build();
+    }
+
+
+}
+
+// generators/TokenGeneratorProvider.java
+package me.markgerald.generators;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import me.markgerald.model.PaymentProvider;
+
+@ApplicationScoped
+public class TokenGeneratorProvider {
+
+    @Inject
+    private MastercardTokenGenerator mastercardTokenGenerator;
+
+    @Inject
+    private VisaTokenGenerator visaTokenGenerator;
+
+    public TokenGenerator getTokenGenerator(PaymentProvider paymentProvider) {
+        switch (paymentProvider) {
+            case MASTERCARD:
+                return mastercardTokenGenerator;
+            case VISA:
+                return visaTokenGenerator;
+            default:
+                throw new IllegalArgumentException("Invalid Payment Provider");
+        }
+    }
+}
+
+
+// generators/TokenGenerator.java
+package me.markgerald.generators;
+
+public interface TokenGenerator {
+    String generateToken(String cardNumber, String cvv);
+}
+
+//
+// generators/MastercardTokenGenerator.java
+package me.markgerald.generators;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+
+@ApplicationScoped
+public class MastercardTokenGenerator implements TokenGenerator {
+
+    @Override
+    public String generateToken(String cardNumber, String cvv) {
+        try {
+            String dataToHash = cardNumber + cvv;
+            MessageDigest md = MessageDigest.getInstance("MD5");
+            byte[] hashBytes = md.digest(dataToHash.getBytes());
+
+            StringBuilder token = new StringBuilder();
+            for (byte b : hashBytes) {
+                token.append(String.format("%02x", b));
+            }
+
+            return token.toString();
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("Error generating token for Provider A");
+        }
+    }
+}
+
+// generators/VisaTokenGenerator.java
+package me.markgerald.generators;
+
+import jakarta.enterprise.context.ApplicationScoped;
+
+@ApplicationScoped
+public class VisaTokenGenerator implements TokenGenerator {
+    @Override
+    public String generateToken(String cardNumber, String cvv) {
+        int rotations = Integer.parseInt(cvv);
+
+        int[] cardArray = cardNumber.chars()
+                .map(Character::getNumericValue)
+                .toArray();
+
+        for (int i = 0; i < rotations; i++) {
+            int lastElement = cardArray[cardArray.length - 1];
+            System.arraycopy(cardArray, 0, cardArray, 1, cardArray.length - 1);
+            cardArray[0] = lastElement;
+        }
+
+        StringBuilder token = new StringBuilder();
+        for (int digit : cardArray) {
+            token.append(digit);
+        }
+
+        return token.toString();
+    }
+}
+
+
+// model/PaymentProvider.java
+package me.markgerald.model;
+
+public enum PaymentProvider {
+    MASTERCARD,
+    VISA;
+}
+
+// request/CardRequest.java
+package me.markgerald.request;
+
+import jakarta.json.bind.annotation.JsonbCreator;
+import jakarta.json.bind.annotation.JsonbProperty;
+
+public class CardRequest {
+
+    @JsonbProperty("cardNumber")
+    private String cardNumber;
+    @JsonbProperty("cvv")
+    private String cvv;
+
+    @JsonbCreator
+    public CardRequest(@JsonbProperty("cardNumber") String cardNumber, @JsonbProperty("cvv") String cvv) {
+        this.cardNumber = cardNumber;
+        this.cvv = cvv;
+    }
+
+    public String getCardNumber() {
+        return cardNumber;
+    }
+
+    public String getCvv() {
+        return cvv;
+    }
+
+}
+
+// response/CardResponse.java
+package me.markgerald.response;
+
+
+import jakarta.json.bind.annotation.JsonbProperty;
+
+public class CardResponse {
+
+    @JsonbProperty("token")
+    private String token;
+
+    public CardResponse(String token) {
+        this.token = token;
+    }
+
+    public String getToken() {
+        return token;
+    }
+
+    public void setToken(String token) {
+        this.token = token;
+    }
+}
+
+// storage/TokenStorage.java
+package me.markgerald.storage;
+
+import java.util.HashMap;
+import java.util.Map;
+public class TokenStorage {
+    private static final Map<String, String> tokens = new HashMap<>();
+
+    public static void saveToken(String customerId, String token) {
+        tokens.put(customerId, token);
+    }
+
+    public static String getToken(String customerId) {
+        return tokens.get(customerId);
+    }
+}
+
+// validation/PaymentProviderValidation.java
+package me.markgerald.validation;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import me.markgerald.model.PaymentProvider;
+
+@ApplicationScoped
+public class PaymentProviderValidation {
+    public PaymentProvider parsePaymentProvider(String providerHeaderValue) {
+        try {
+            return PaymentProvider.valueOf(providerHeaderValue.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+}
+
